@@ -31,7 +31,7 @@ class Router(nn.Module):
 
 
 class MoE(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_experts, num_classes):
+    def __init__(self, input_dim, hidden_dim, num_experts, num_classes, top_k):
         super(MoE, self).__init__()
         self.num_experts = num_experts
         self.experts = nn.ModuleList(
@@ -39,6 +39,8 @@ class MoE(nn.Module):
         )
         self.gate = Router(input_dim, num_experts)
         self.classifier = nn.Linear(hidden_dim, num_classes)
+        self.top_k = top_k
+        assert top_k <= num_experts, "top_k should be less than or equal to num_experts"
 
     def forward(self, x):
         scores = self.gate(x)
@@ -54,14 +56,27 @@ class MoE(nn.Module):
             )  # [batch_size, num_experts, num_classes]
             return expert_outs, scores
         else:
-            selected_experts = torch.multinomial(scores, 1).squeeze()
+            selected_experts = torch.multinomial(
+                scores, self.top_k
+            )  # [batch_size, top_k]
             expert_outs = [expert(x) for expert in self.experts]
             expert_outs = torch.stack(expert_outs).permute(
                 1, 0, 2
             )  # [batch_size, num_experts, hidden_dim]
             # select only the expert outputs that were selected
-            expert_outs = expert_outs[torch.arange(x.size(0)), selected_experts]
-            return self.classifier(expert_outs)
+            expert_outs = expert_outs[
+                torch.arange(expert_outs.size(0)).unsqueeze(1), selected_experts
+            ]  # [batch_size, top_k, hidden_dim]
+
+            # scores are normalized so they can be used as weights # [batch_size, hidden_dim]
+            expert_outs = torch.sum(
+                expert_outs
+                * scores[
+                    torch.arange(expert_outs.size(0)).unsqueeze(1), selected_experts
+                ].unsqueeze(-1),
+                dim=1,
+            )
+            return self.classifier(expert_outs)  # [batch_size, num_classes]
 
 
 def train(model, train_loader, val_loader, optimizer, scheduler, device, num_epochs=10):
@@ -175,13 +190,14 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     hidden_dim = 512
-    num_experts = 4
+    num_experts = 20
     num_classes = 10
     batch_size = 128
     num_epochs = 100
+    top_k = 8
 
     train_loader, val_loader, input_dim = get_dataloaders(args.dataset, batch_size)
-    model = MoE(input_dim, hidden_dim, num_experts, num_classes).to(device)
+    model = MoE(input_dim, hidden_dim, num_experts, num_classes, top_k).to(device)
 
     optimizer = optim.Adam(
         [
