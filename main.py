@@ -5,6 +5,7 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import argparse
 
 
 class Expert(nn.Module):
@@ -22,11 +23,11 @@ class Expert(nn.Module):
 class Router(nn.Module):
     def __init__(self, input_dim, num_experts):
         super(Router, self).__init__()
-        self.fc1 = nn.Linear(input_dim, num_experts)
+        self.fc1 = nn.Linear(input_dim, input_dim)
         self.fc2 = nn.Linear(input_dim, num_experts)
 
     def forward(self, x):
-        return torch.softmax(torch.relu(self.fc1(x)), dim=1)
+        return torch.softmax(self.fc2(torch.relu(self.fc1(x))), dim=1)
 
 
 class MoE(nn.Module):
@@ -41,9 +42,10 @@ class MoE(nn.Module):
 
     def forward(self, x):
         scores = self.gate(x)
-        # select one expert stochastically based on the gate values
         if self.training:
-            expert_outs = [expert(x) for expert in self.experts]
+            expert_outs = [
+                expert(x) for expert in self.experts
+            ]  # [num_experts, batch_size, hidden_dim]
             expert_outs = torch.stack(expert_outs).permute(
                 1, 0, 2
             )  # [batch_size, num_experts, hidden_dim]
@@ -53,21 +55,18 @@ class MoE(nn.Module):
             return expert_outs, scores
         else:
             selected_experts = torch.multinomial(scores, 1).squeeze()
-            # TODO -- faster way. selected expert will be of size [batch_size]
-            experts = [self.experts[i] for i in selected_experts]
-            expert_outs = [expert(x[i]) for i, expert in enumerate(experts)]
-            expert_outs = torch.stack(expert_outs)
+            expert_outs = [expert(x) for expert in self.experts]
+            expert_outs = torch.stack(expert_outs).permute(
+                1, 0, 2
+            )  # [batch_size, num_experts, hidden_dim]
+            # select only the expert outputs that were selected
+            expert_outs = expert_outs[torch.arange(x.size(0)), selected_experts]
             return self.classifier(expert_outs)
 
 
-def train(model, train_loader, val_loader, optimizer, device, num_epochs=10):
+def train(model, train_loader, val_loader, optimizer, scheduler, device, num_epochs=10):
     def get_loss(expert_outputs, scores, labels):
-        # expert_outputs: [batch_size, num_experts, num_classes]
-        # scores: [batch_size, num_experts]
-        # labels: [batch_size]
         def dist(x, y, dim):
-            # x is a vector of size [batch_size, num_experts, num_classes]
-            # y is a vector of size [batch_size]
             one_hot_y = torch.zeros_like(x)
             one_hot_y[torch.arange(x.size(0)), :, y] = 1
             return torch.sum((x - one_hot_y) ** 2, dim=dim)
@@ -106,6 +105,7 @@ def train(model, train_loader, val_loader, optimizer, device, num_epochs=10):
         print(
             f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {running_loss/len(train_loader):.4f}, Val Acc: {val_acc:.4f}"
         )
+        scheduler.step()
 
 
 def validate(model, val_loader, device):
@@ -125,20 +125,32 @@ def validate(model, val_loader, device):
     return val_acc
 
 
-def get_cifar10_dataloaders(batch_size):
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]
-    )
-
-    train_dataset = torchvision.datasets.CIFAR10(
-        root="./data", train=True, download=True, transform=transform
-    )
-    val_dataset = torchvision.datasets.CIFAR10(
-        root="./data", train=False, download=True, transform=transform
-    )
+def get_dataloaders(dataset, batch_size):
+    if dataset == "cifar10":
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        )
+        train_dataset = torchvision.datasets.CIFAR10(
+            root="./data", train=True, download=True, transform=transform
+        )
+        val_dataset = torchvision.datasets.CIFAR10(
+            root="./data", train=False, download=True, transform=transform
+        )
+        input_dim = 32 * 32 * 3
+    elif dataset == "mnist":
+        transform = transforms.Compose(
+            [transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))]
+        )
+        train_dataset = torchvision.datasets.MNIST(
+            root="./data", train=True, download=True, transform=transform
+        )
+        val_dataset = torchvision.datasets.MNIST(
+            root="./data", train=False, download=True, transform=transform
+        )
+        input_dim = 28 * 28
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=2
@@ -147,22 +159,30 @@ def get_cifar10_dataloaders(batch_size):
         val_dataset, batch_size=batch_size * 4, shuffle=False, num_workers=2
     )
 
-    return train_loader, val_loader
+    return train_loader, val_loader, input_dim
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="mnist",
+        choices=["mnist", "cifar10"],
+        help="Dataset to use",
+    )
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    input_dim = 32 * 32 * 3  # CIFAR-10 images are 32x32 with 3 channels
     hidden_dim = 512
     num_experts = 4
     num_classes = 10
     batch_size = 128
-    num_epochs = 10
+    num_epochs = 100
 
-    train_loader, val_loader = get_cifar10_dataloaders(batch_size)
+    train_loader, val_loader, input_dim = get_dataloaders(args.dataset, batch_size)
     model = MoE(input_dim, hidden_dim, num_experts, num_classes).to(device)
 
-    # several learning rates for experts, router and classifier
     optimizer = optim.Adam(
         [
             {"params": model.experts.parameters(), "lr": 1e-5},
@@ -170,7 +190,9 @@ def main():
             {"params": model.classifier.parameters(), "lr": 1e-5},
         ]
     )
-    train(model, train_loader, val_loader, optimizer, device, num_epochs)
+    # exponentially decrease the learning rate
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, 0.96)
+    train(model, train_loader, val_loader, optimizer, scheduler, device, num_epochs)
 
 
 if __name__ == "__main__":
